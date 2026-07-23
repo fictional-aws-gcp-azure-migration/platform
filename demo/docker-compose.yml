@@ -1,0 +1,95 @@
+# End-to-end showcase: both teams' services, wired together.
+#
+# This is the ONE place that legitimately knows about both repos. The service
+# repos each run standalone; the platform team owns the integrated demo, which
+# mirrors how the paved-road team owns cross-cutting concerns without owning the
+# teams' code.
+#
+# Build contexts point at the sibling repos, so this expects the three repos
+# checked out side by side:
+#   <workspace>/inventory-service
+#   <workspace>/orders-service
+#   <workspace>/platform
+#
+# Flow exercised:
+#   seed -> orders API -> (sync) inventory API for stock check
+#                      -> (async) SQS -> inventory worker -> DynamoDB
+
+name: migration-demo
+
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: sqs,dynamodb
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  inventory-bootstrap:
+    build: ../../inventory-service
+    command: ["python", "scripts/bootstrap_local.py"]
+    environment: &inv_env
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-west-2
+      TABLE_NAME: inventory
+      QUEUE_NAME: order-placed
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  inventory-api:
+    build: ../../inventory-service
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *inv_env
+    ports:
+      - "8001:8000"
+    depends_on:
+      inventory-bootstrap:
+        condition: service_completed_successfully
+
+  inventory-worker:
+    build: ../../inventory-service
+    command: ["python", "-m", "app.local_poller"]
+    environment: *inv_env
+    depends_on:
+      inventory-bootstrap:
+        condition: service_completed_successfully
+
+  orders-api:
+    build: ../../orders-service
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql://orders:orders@postgres:5432/orders
+      APPLY_SCHEMA: "1"
+      # In AWS this URL is read from SSM; here it is the inventory service on
+      # the compose network. Same contract, different lookup.
+      INVENTORY_URL: http://inventory-api:8000
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-west-2
+      QUEUE_NAME: order-placed
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inventory-api:
+        condition: service_started
