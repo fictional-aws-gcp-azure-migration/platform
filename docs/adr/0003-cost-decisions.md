@@ -36,6 +36,11 @@ real even though the account boundary is simulated. This is stated plainly
 rather than hidden, and it avoids spending a day on AWS Organizations for a
 demo.
 
+The full account/org baseline this shortcut stands in for — topology, guardrails,
+centralized logging, tagging, account vending — is written up in
+[landing-zone-standards.md](../landing-zone-standards.md); the decision to specify
+it rather than deploy it is [ADR 0004](0004-landing-zone-standards.md).
+
 ## Consequences
 
 - The whole thing tears down with a documented `terragrunt run --all -- destroy`,

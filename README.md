@@ -77,3 +77,10 @@ repos. Autonomy has a real cost (you can't read one repo to see the whole
 estate), paid back by three structural guarantees rather than a governance
 apparatus. See [docs/adr](docs/adr) across the repos for the reasoning, and this
 repo's ADRs for the platform-level decisions.
+
+The account/org baseline the whole sample lands on — accounts per team,
+guardrails, centralized logging, tagging, and account vending, with a GCP/Azure
+mapping for the migration targets — is specified in
+[docs/landing-zone-standards.md](docs/landing-zone-standards.md). The demo runs it
+as a single-account shortcut on purpose; the reasoning is
+[ADR 0004](docs/adr/0004-landing-zone-standards.md).
