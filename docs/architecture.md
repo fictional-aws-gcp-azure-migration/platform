@@ -1,115 +1,107 @@
 # Architecture
 
-An AWS-native "before" system, designed so a later migration off AWS is a
-data-migration problem plus a redeploy — not a rewrite.
+A small ordering system on AWS, split across two services. It's built so it can
+be moved to GCP or Azure later without a rewrite: the application code stays put,
+and the work is migrating the data and swapping a few adapter files.
 
-> **Ephemeral compute is portable; persistent state is not.** Draw the seam
-> there, and the migration cost concentrates where it actually lives: the
-> stateful stores.
+## The two services
 
-## System
+- **orders-service** — an order API on ECS Fargate behind an ALB, backed by RDS
+  Postgres.
+- **inventory-service** — stock tracking on two Lambdas (a read API behind API
+  Gateway, and an SQS worker), backed by DynamoDB.
+
+Each team owns one repo, with its application code and infrastructure together.
 
 ```mermaid
 flowchart LR
     client([Client])
 
-    subgraph orders["orders-service &mdash; team A &bull; CONTAINERIZED"]
+    subgraph orders["orders-service (containerized)"]
         direction TB
         alb[ALB]
-        api["orders-api<br/>ECS Fargate &bull; FastAPI"]
-        pg[("RDS PostgreSQL<br/>orders, order_lines")]
+        api["orders-api<br/>ECS Fargate"]
+        pg[(RDS Postgres)]
         alb --> api
-        api -- "writes order" --> pg
+        api --> pg
     end
 
-    subgraph inventory["inventory-service &mdash; team B &bull; SERVERLESS &bull; no VPC"]
+    subgraph inventory["inventory-service (serverless)"]
         direction TB
-        agw["API Gateway HTTP API<br/>IAM-authorized"]
-        invapi["inventory-api<br/>Lambda &bull; Mangum(FastAPI)"]
-        q["SQS<br/>order-placed (+DLQ)"]
-        worker["inventory-worker<br/>Lambda &bull; SQS source"]
-        ddb[("DynamoDB<br/>stock + events, GSI1")]
+        agw[API Gateway]
+        invapi["inventory-api<br/>Lambda"]
+        q[SQS + DLQ]
+        worker["inventory-worker<br/>Lambda"]
+        ddb[(DynamoDB)]
         agw --> invapi
-        invapi -- "read stock" --> ddb
+        invapi --> ddb
         q --> worker
-        worker -- "decrement + event" --> ddb
+        worker --> ddb
     end
 
-    ssm[["SSM Parameter Store<br/>/platform/inventory/api-url"]]
+    ssm[[SSM Parameter Store]]
 
-    client -->|HTTP| alb
-    api -. "SigV4-signed<br/>GET /stock/{sku}" .-> agw
-    api ==>|"publish OrderPlaced"| q
-    invapi -. "publishes URL" .-> ssm
-    api -. "reads URL (contract,<br/>not shared state)" .-> ssm
-
-    classDef sync stroke-dasharray:4 3
+    client --> alb
+    api -->|"read stock (signed)"| agw
+    api -->|OrderPlaced| q
+    invapi -.->|publishes URL| ssm
+    api -.->|reads URL| ssm
 ```
 
-**Two paths between the teams, one contract seam:**
+## How the two services talk
 
-- **Sync** (dashed): `orders-api` reads stock from inventory's API Gateway before
-  accepting an order. The route is IAM-authorized, so the call is SigV4-signed
-  with the task role — no API keys, no static secrets.
-- **Async** (bold): `orders-api` publishes `OrderPlaced` to SQS; the worker
-  decrements stock with a conditional write and logs the movement.
-- **Contract, not shared state**: inventory publishes its URL to SSM; orders
-  reads it. Neither team touches the other's Terraform state, so either can
-  deploy first and they can live in separate accounts unchanged.
+orders-service calls inventory in two ways:
 
-## Why the two services look different
+- **Synchronously** to check stock before accepting an order. The API Gateway
+  route uses IAM auth, so the call is SigV4-signed with the task role. No API
+  keys or shared secrets.
+- **Asynchronously** by publishing an `OrderPlaced` message to SQS. The worker
+  picks it up and decrements stock with a conditional write.
 
-The asymmetry is deliberate — a realistic portfolio, not a symmetric diagram.
+They don't share Terraform state. inventory-service writes its API URL to SSM
+Parameter Store and orders-service reads it from there. Either service can deploy
+first, and they could run in separate AWS accounts without changing anything.
+
+## Why the services have different shapes
+
+One is containerized, one is serverless. That's on purpose — it covers both
+common patterns and gives two different migration paths to reason about.
 
 | | orders-service | inventory-service |
 |---|---|---|
-| Pattern | **Containerized** | **Serverless** |
+| Pattern | Containerized | Serverless |
 | Compute | ECS Fargate + ALB | 2 Lambdas + API Gateway |
-| Store | RDS PostgreSQL | DynamoDB |
-| Network | VPC (public + private, **no NAT**) | **No VPC** |
-| Migration seam | clean (managed logical replication) | hard (no equivalent service) |
+| Store | RDS Postgres | DynamoDB |
+| Network | VPC, public + private subnets, no NAT | No VPC |
 
-## The migration seam (what Phase 2 exploits)
+The inventory Lambdas only reach DynamoDB, SQS, and SSM, which are all public AWS
+endpoints, so they don't need a VPC. orders-service does, because its Fargate
+tasks talk to a private RDS instance.
 
-Business logic never knows what invoked it or what stores it. The AWS coupling
-is confined to named, deletable files:
+## Moving off AWS
 
-```mermaid
-flowchart TB
-    subgraph logic["Portable core (no boto3, no FastAPI-Lambda coupling)"]
-        core["core.handle_order_placed()"]
-        repoif["StockRepository (interface)"]
-    end
-    subgraph aws["AWS-specific edge (the entire migration surface)"]
-        mangum["lambda_api.py &mdash; Mangum(app)"]
-        lh["lambda_worker.py &mdash; SQS unwrap"]
-        dynamo["dynamo.py &mdash; DynamoDB impl"]
-    end
-    subgraph k8s["Phase 2 edge (swap, don't rewrite)"]
-        uvicorn["uvicorn in a container"]
-        keda["KEDA-scaled poller"]
-        newdb["Firestore / Cosmos impl"]
-    end
-    mangum -.->|delete| uvicorn
-    lh -.->|replace| keda
-    dynamo -.->|swap| newdb
-    core --- repoif
-```
+The business logic doesn't import boto3 or know it runs on Lambda. The
+AWS-specific code is kept to a few files, so migrating compute means swapping
+those rather than touching the logic:
 
-The full per-dependency portability rating is in the
-[platform README](../README.md#aws-coupling-inventory--the-bridge-to-phase-2).
+- `lambda_api.py` (Mangum adapter) → run the same FastAPI app under uvicorn in a
+  container.
+- `lambda_worker.py` (SQS handler) → run the same handler from a KEDA-scaled
+  poller.
+- `dynamo.py` (DynamoDB) → a Firestore or Cosmos implementation behind the same
+  `StockRepository` interface.
 
-## The honest finding
+The data is the real work, and it splits cleanly:
 
-Migration difficulty tracks the store, not the compute:
+- **Postgres is straightforward.** RDS to Cloud SQL or Azure Database for
+  PostgreSQL is mostly managed logical replication. The schema is already set up
+  for it: every table has a primary key, and `updated_at` is maintained by a
+  trigger.
+- **DynamoDB is the hard part.** There's no equivalent managed service on GCP or
+  Azure, and no near-zero-downtime migration tool for it. Keeping every DynamoDB
+  call behind the `StockRepository` interface contains that work to one file
+  instead of spreading it through the codebase.
 
-- **Postgres → Cloud SQL / Azure Flexible Server: easy.** Managed logical
-  replication; the schema is already replication-ready (every table has a PK;
-  `updated_at` is trigger-maintained).
-- **DynamoDB → anything: hard.** No equivalent managed service, and no
-  first-party near-zero-downtime tooling on either cloud. The repository
-  interface is what turns that from a rewrite into a swappable implementation.
-
-Naming that asymmetry up front — and designing the source so the easy half stays
-easy and the hard half is contained — is the actual demonstration of migration
-experience.
+For the full per-dependency breakdown, see the
+[AWS-coupling table](../README.md#aws-coupling-inventory--the-bridge-to-phase-2)
+in the platform README.
