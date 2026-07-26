@@ -1,0 +1,75 @@
+# Reusable application CI: lint + test, with optional Postgres and contract-drift gate.
+#
+# Owned by the platform team, consumed by each service repo with a versioning
+# strategy (callers pin `@vX.Y.Z`). Same reusable module, per-service inputs --
+# this is the "shared modules, versioning strategies" the estate runs on.
+#
+# Runs the documented developer commands verbatim (see each service README):
+#   uv run ruff check .
+#   uv run pytest
+#   uv run python scripts/gen_contract.py --check   (contract-check: true)
+name: python-ci
+
+on:
+  workflow_call:
+    inputs:
+      postgres:
+        description: >-
+          Start a Postgres service and export DATABASE_URL, so tests that assert
+          on real database behaviour (e.g. trigger-maintained columns) run
+          instead of skipping. Services without a database leave this false.
+        type: boolean
+        default: false
+      contract-check:
+        description: >-
+          Run scripts/gen_contract.py --check to fail the build if the published
+          OpenAPI contract has drifted from the implementation (ADR 0002).
+        type: boolean
+        default: false
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    # Always declared; only consumed when inputs.postgres is true (a service
+    # container cannot be gated by an expression). Mirrors the compose Postgres:
+    # user/password/db all "orders".
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+          POSTGRES_DB: orders
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orders"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv + Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (frozen)
+        run: uv sync --extra dev --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        # DATABASE_URL is only exported when a caller asked for Postgres; without
+        # it the database-backed test skips exactly as it does locally.
+        env:
+          DATABASE_URL: ${{ inputs.postgres && 'postgresql://orders:orders@localhost:5432/orders' || '' }}
+        run: uv run pytest
+
+      - name: Contract drift gate
+        if: ${{ inputs.contract-check }}
+        run: uv run python scripts/gen_contract.py --check

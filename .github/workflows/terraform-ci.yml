@@ -1,0 +1,82 @@
+# Reusable infrastructure CI: static validation + security guardrails, no AWS needed.
+#
+# Every check here runs on a clean checkout with zero cloud credentials, so it
+# gates every PR without a landing zone existing yet. The real `plan` (which
+# needs the S3 state backend and an assumed role) lives in terraform-plan.yml
+# and only runs once the account is bootstrapped.
+#
+# Checks, in order:
+#   1. terraform fmt   -- formatting is a baseline, enforced not reviewed.
+#   2. terragrunt hcl validate -- the live/ wiring (root.hcl, dependency blocks,
+#      mock_outputs) parses and resolves.
+#   3. terraform validate per module (init -backend=false) -- the actual modules
+#      type-check against the pinned providers. Backend is skipped so no S3/AWS
+#      is touched; modules carry no backend or dependency blocks, so they
+#      validate standalone.
+#   4. checkov -- the security guardrail / configuration baseline. Inline
+#      `# checkov:skip=` annotations (each with a documented cost/demo rationale)
+#      are honored automatically, so a passing run means "no un-annotated finding."
+name: terraform-ci
+
+on:
+  workflow_call:
+    inputs:
+      infra-dir:
+        description: "Path to the Terraform/Terragrunt tree, relative to repo root."
+        type: string
+        default: infra
+
+env:
+  # Pinned so every team runs the identical toolchain (the versioning strategy
+  # applies to tools, not just workflows). Bump here, once, for the whole estate.
+  TERRAFORM_VERSION: "1.9.8"
+  TERRAGRUNT_VERSION: "1.1.1"
+  CHECKOV_VERSION: "3.3.0"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false # keep raw exit codes for the loop below
+
+      - name: Install Terragrunt
+        run: |
+          curl -sSLo /usr/local/bin/terragrunt \
+            "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64"
+          chmod +x /usr/local/bin/terragrunt
+          terragrunt --version
+
+      - name: Set up Python (for checkov)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install checkov
+        run: pip install "checkov==${CHECKOV_VERSION}"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive "${{ inputs.infra-dir }}"
+
+      - name: Terragrunt HCL validate
+        working-directory: ${{ inputs.infra-dir }}
+        run: terragrunt hcl validate
+
+      - name: Terraform validate (per module, no backend)
+        working-directory: ${{ inputs.infra-dir }}
+        run: |
+          set -euo pipefail
+          for module in modules/*/; do
+            echo "::group::validate ${module}"
+            terraform -chdir="${module}" init -backend=false -input=false
+            terraform -chdir="${module}" validate
+            echo "::endgroup::"
+          done
+
+      - name: Checkov (security baseline)
+        run: checkov -d "${{ inputs.infra-dir }}" --compact --quiet

@@ -1,0 +1,26 @@
+# Platform self-CI: the team that owns the reusable workflows holds itself to the
+# same bar. The reusable workflows are the product, so they get linted; demo.sh is
+# the one shipped script, so it gets shellcheck.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck demo.sh
+        run: shellcheck demo.sh

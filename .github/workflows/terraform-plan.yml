@@ -1,0 +1,68 @@
+# Reusable infrastructure PLAN: OIDC-authenticated `terragrunt run --all -- plan`.
+#
+# This is the deploy-track half of the paved road, wired now and INERT until the
+# account is bootstrapped. It authenticates to AWS with GitHub OIDC (no long-lived
+# keys) and runs a real plan against the S3 state backend.
+#
+# It stays dormant because callers guard it with `if: vars.AWS_ROLE_ARN != ''`.
+# It goes live once the deploy track provisions, once, per account:
+#   - the GitHub OIDC provider + a least-privilege plan/deploy role, and
+#   - the `migration-examples-tfstate-<account>` state bucket (root.hcl backend).
+# Then set the repo/org variables AWS_ROLE_ARN and AWS_ACCOUNT_ID and it runs.
+name: terraform-plan
+
+on:
+  workflow_call:
+    inputs:
+      role-arn:
+        description: "IAM role ARN to assume via OIDC (the CI plan/deploy role)."
+        type: string
+        required: true
+      aws-account-id:
+        description: "Account id; feeds the per-team S3 state bucket name in root.hcl."
+        type: string
+        required: true
+      infra-dir:
+        description: "Path to the live Terragrunt tree to plan, relative to repo root."
+        type: string
+        default: infra/live/dev
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  TERRAGRUNT_VERSION: "1.1.1"
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: us-west-2
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Terragrunt
+        run: |
+          curl -sSLo /usr/local/bin/terragrunt \
+            "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64"
+          chmod +x /usr/local/bin/terragrunt
+
+      - name: Terragrunt plan
+        working-directory: ${{ inputs.infra-dir }}
+        env:
+          # root.hcl reads this to name the per-team state bucket and pin
+          # allowed_account_ids. mock_outputs cover cross-unit deps on a first plan.
+          AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+        run: terragrunt run --all -- plan
